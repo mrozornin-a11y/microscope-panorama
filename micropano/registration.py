@@ -68,6 +68,19 @@ class Prepared:
     sharpness: float
     _work_hp: Optional[np.ndarray] = field(default=None, repr=False)
     _spectra: Optional[tuple] = field(default=None, repr=False)
+    _link: Optional["LinkData"] = field(default=None, repr=False)
+
+
+@dataclass
+class LinkData:
+    """Specimen-only representation of a frame for cross-segment matching:
+    the black background around the specimen and a band along the outer
+    specimen boundary are excluded, so that the long high-contrast edge of
+    the section cannot dominate the correlation."""
+    core_w: np.ndarray            # uint8 0/255 mask at working scale
+    work_hp: np.ndarray           # float32 high-pass, zero outside core_w
+    spectra: tuple                # (F, F2, M) at coarse scale
+    frac: float                   # core area / field-of-view area
 
 
 def resize_exact(img: np.ndarray, scale: float, size: Tuple[int, int],
@@ -167,6 +180,25 @@ class MaskedNCC:
         return np.clip(ncc, -1.0, 1.0)
 
 
+def _masked_ncc_general(eng: "MaskedNCC", A: tuple, B: tuple, min_overlap_px: float):
+    """Padfield masked NCC with different masks for both images.
+    A, B: (F, F2, M) spectra of image*mask, image^2*mask and mask."""
+    F, F2, Mf = A
+    G, G2, Mg = B
+    ov = np.round(eng._corr(Mf, Mg))
+    valid = ov >= max(min_overlap_px, 16)
+    ovs = np.maximum(ov, 1.0)
+    fm = eng._corr(F, Mg)
+    mg = eng._corr(Mf, G)
+    num = eng._corr(F, G) - fm * mg / ovs
+    d1 = eng._corr(F2, Mg) - fm * fm / ovs
+    d2 = eng._corr(Mf, G2) - mg * mg / ovs
+    den = np.sqrt(np.maximum(d1, 0) * np.maximum(d2, 0))
+    tol = 1e-4 * max(float(np.max(den)), 1e-12)
+    ncc = np.where((den > tol) & valid, num / np.maximum(den, tol), 0.0)
+    return np.clip(ncc, -1.0, 1.0), valid, ov
+
+
 class Registrar:
     def __init__(self, fov: FieldOfView, settings: Settings):
         self.fov = fov
@@ -218,7 +250,13 @@ class Registrar:
                      strict: bool = False) -> Optional[CoarseMatch]:
         st = self.settings
         ncc = self.ncc(self._spectra(a), self._spectra(b))
-        score = np.where(self.ncc.valid, ncc, -np.inf)
+        return self._peak(ncc, self.ncc.valid, self.ncc.overlap, self.ncc.area,
+                          pred, radius, strict)
+
+    def _peak(self, ncc, valid, overlap_map, area, pred, radius,
+              strict) -> Optional[CoarseMatch]:
+        st = self.settings
+        score = np.where(valid, ncc, -np.inf)
         yy, xx = self._grid
         if pred is not None and radius is not None:
             region = (yy - pred[1]) ** 2 + (xx - pred[0]) ** 2 <= radius * radius
@@ -248,7 +286,7 @@ class Registrar:
             den = u - 2 * c + d
             if den < 0:
                 dy = float(np.clip(0.5 * (u - d) / den, -0.5, 0.5))
-        overlap = float(self.ncc.overlap[py, px]) / self.ncc.area
+        overlap = float(overlap_map[py, px]) / area
         m = CoarseMatch(sx0 + dx, sy0 + dy, peak, second, overlap)
         min_ncc = st.min_ncc * (1.5 if strict else 1.0)
         max_ratio = st.max_peak_ratio * (0.9 if strict else 1.0)
@@ -259,19 +297,31 @@ class Registrar:
         return m
 
     # ----------------------------------------------------------------- fine
-    def refine(self, a: Prepared, b: Prepared, cm: CoarseMatch) -> Optional[RelPose]:
+    def refine(self, a: Prepared, b: Prepared, cm: CoarseMatch,
+               ha: Optional[np.ndarray] = None, hb: Optional[np.ndarray] = None,
+               mask_a: Optional[np.ndarray] = None,
+               mask_b: Optional[np.ndarray] = None) -> Optional[RelPose]:
+        """ECC alignment.  By default the whole field of view is used; the
+        cross-segment linking passes specimen-only images and masks."""
         st = self.settings
-        ha, hb = self.work_hp(a), self.work_hp(b)
+        if ha is None:
+            ha = self.work_hp(a)
+        if hb is None:
+            hb = self.work_hp(b)
+        if mask_a is None:
+            mask_a = self.mask_w
+        if mask_b is None:
+            mask_b = self.mask_w
         tw0 = np.array([-cm.sx * self.f_cw, -cm.sy * self.f_cw])  # p_B = p_A + tw
         W = np.array([[1, 0, tw0[0]], [0, 1, tw0[1]]], np.float32)
         h, w = self.mask_w.shape
         rot_allowed = st.max_rotation_deg > 0
         # valid input pixels: inside B's circle AND inside A's circle mapped
         # into B coordinates (with a safety erosion).
-        ma = cv2.warpAffine(self.mask_w, W, (w, h), flags=cv2.INTER_NEAREST)
+        ma = cv2.warpAffine(mask_a, W, (w, h), flags=cv2.INTER_NEAREST)
         erode = 3 + int(math.ceil(math.radians(st.max_rotation_deg) * self.D * self.s_work / 2))
         k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * erode + 1, 2 * erode + 1))
-        mask_in = cv2.erode(ma & self.mask_w, k)
+        mask_in = cv2.erode(ma & mask_b, k)
         ov = float((mask_in > 0).sum()) / self.area_w
         if ov < st.min_overlap_area * 0.7:
             return None
@@ -301,6 +351,65 @@ class Registrar:
         RwT = Rw.T
         d = -RwT @ e / self.s_work
         return RelPose(float(d[0]), float(d[1]), -ang, float(rho), cm.peak, ov)
+
+    # ------------------------------------------------- cross-segment linking
+    def link_data(self, p: Prepared, cache: bool = True) -> LinkData:
+        """Specimen mask: large dark regions inside the field of view are the
+        background around the section; they are removed together with a band
+        of `link_edge_band` x diameter along their boundary.  Small dark spots
+        (pores, opaque grains) stay part of the specimen."""
+        if p._link is not None:
+            return p._link
+        st = self.settings
+        fov = self.mask_w > 0
+        g = cv2.GaussianBlur(p.work, (0, 0), 2.0)
+        vals = g[fov]
+        thr = max(st.link_dark_level, 0.3 * float(np.percentile(vals, 95)) if vals.size else 0)
+        dark = ((g < thr) & fov).astype(np.uint8)
+        dark = cv2.morphologyEx(dark, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        n, lab, stats, _ = cv2.connectedComponentsWithStats(dark)
+        big = stats[:, cv2.CC_STAT_AREA] > 0.01 * fov.sum()
+        big[0] = False
+        bg = big[lab]
+        content = (fov & ~bg).astype(np.uint8) * 255
+        band = max(2, int(round(st.link_edge_band * self.D * self.s_work)))
+        kb = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * band + 1, 2 * band + 1))
+        core = content & ~cv2.dilate(bg.astype(np.uint8) * 255, kb)
+        core = cv2.erode(core, np.ones((5, 5), np.uint8))   # off the FOV rim too
+        frac = float((core > 0).sum()) / max(float(fov.sum()), 1.0)
+
+        def hp_on(gray, cont, cor, sigma):
+            h = highpass(gray, cont, sigma) * (cor > 0)
+            sd = float(np.sqrt((h ** 2).sum() / max((cor > 0).sum(), 1)))
+            return (h / sd if sd > 0 else h).astype(np.float32)
+
+        work_hp = hp_on(p.work, content, core, self.sigma_w)
+        f = self.s_coarse / self.s_work
+        gc = resize_exact(p.work, f, self.coarse_size)
+        cont_c = (resize_exact(content, f, self.coarse_size) > 127).astype(np.uint8) * 255
+        core_c = (resize_exact(core, f, self.coarse_size) > 250).astype(np.uint8) * 255
+        hc = hp_on(gc, cont_c, core_c, self.sigma_c)
+        mc = (core_c > 0).astype(np.float32)
+        sh = self.ncc.shape
+        spectra = (sfft.rfft2(hc * mc, s=sh), sfft.rfft2(hc * hc * mc, s=sh),
+                   sfft.rfft2(mc, s=sh))
+        ld = LinkData(core, work_hp, spectra, frac)
+        if cache:
+            p._link = ld
+        return ld
+
+    def link_coarse(self, la: LinkData, lb: LinkData) -> Optional[CoarseMatch]:
+        """Global specimen-only correlation search with strict thresholds."""
+        st = self.settings
+        if min(la.frac, lb.frac) < st.link_min_content:
+            return None
+        ncc, valid, ov = _masked_ncc_general(self.ncc, la.spectra, lb.spectra,
+                                             st.min_overlap_area * self.ncc.area)
+        return self._peak(ncc, valid, ov, self.ncc.area, None, None, strict=True)
+
+    def link_refine(self, a: Prepared, b: Prepared, cm: CoarseMatch) -> Optional[RelPose]:
+        la, lb = self.link_data(a, cache=False), self.link_data(b, cache=False)
+        return self.refine(a, b, cm, la.work_hp, lb.work_hp, la.core_w, lb.core_w)
 
     # ---------------------------------------------------------------- utils
     def register(self, a: Prepared, b: Prepared,

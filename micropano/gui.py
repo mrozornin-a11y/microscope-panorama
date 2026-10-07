@@ -208,6 +208,15 @@ _ADVANCED = [
     ("tile_size", "Render tile, px", "", (512, 8192, 256, 0)),
     ("preview_max_size", "Preview size, px", "", (256, 10000, 100, 0)),
     ("threads", "Threads (0 = auto)", "", (0, 128, 1, 0)),
+    ("link_min_matches", "Segment link: min matches",
+     "A disconnected tracking segment is attached only if this many independent "
+     "matches agree on its position.", (1, 10, 1, 0)),
+    ("link_tolerance", "Segment link: tolerance",
+     "Matches agree if the implied segment positions differ by less than this "
+     "fraction of the diameter.", (0.005, 0.2, 0.005, 3)),
+    ("link_edge_band", "Segment link: edge band",
+     "Band along the outer specimen boundary ignored when linking segments "
+     "(fraction of the diameter).", (0.0, 0.3, 0.01, 2)),
 ]
 
 
@@ -245,6 +254,8 @@ class SettingsPanel(QWidget):
         self.flat.setChecked(d.flat_field)
         self.loop = QCheckBox("Cross-pass matching (loop closure)")
         self.loop.setChecked(d.loop_closure)
+        self.link_diag = QCheckBox("Save segment-link diagnostics")
+        self.link_diag.setChecked(d.link_diagnostics)
         self.interp = QComboBox()
         self.interp.addItems(["linear", "cubic", "lanczos"])
         self.interp.setCurrentText(d.interpolation)
@@ -252,6 +263,7 @@ class SettingsPanel(QWidget):
         self.comp.addItems(["zlib", "none"])
         fa.addRow(self.flat)
         fa.addRow(self.loop)
+        fa.addRow(self.link_diag)
         fa.addRow("Interpolation", self.interp)
         fa.addRow("TIFF compression", self.comp)
         self.adv.setVisible(False)
@@ -288,6 +300,7 @@ class SettingsPanel(QWidget):
         st.blending = ["feather", "multiband", "none"][self.blending.currentIndex()]
         st.flat_field = self.flat.isChecked()
         st.loop_closure = self.loop.isChecked()
+        st.link_diagnostics = self.link_diag.isChecked()
         st.interpolation = self.interp.currentText()
         st.tiff_compression = self.comp.currentText()
         return st
@@ -526,6 +539,11 @@ class MainWindow(QMainWindow):
         self.progress.setValue(1000)
         self.lbl_status.setText(f"Done: {res.n_used}/{res.n_keyframes} keyframes used")
         self.log.setPlainText("\n".join(res.log))
+        if res.warnings:
+            self.lbl_status.setText(self.lbl_status.text() + f" — {len(res.warnings)} warning(s)")
+            QMessageBox.warning(self, "Mosaic built with warnings",
+                                "\n\n".join(res.warnings) +
+                                "\n\nSee the Log tab and diagnostics/segment_links.csv.")
         if res.preview is not None:
             self.view_result.set_image(res.preview)
         self.lbl_result.setText(f"mosaic.tif: {res.width} × {res.height} px")

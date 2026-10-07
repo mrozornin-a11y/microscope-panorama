@@ -63,6 +63,28 @@ class Settings:
     # the diameter is considered an outlier and removed.
     outlier_threshold: float = 0.01
 
+    # --- linking of disconnected tracking segments ------------------------
+    # A segment is attached to the main mosaic only if at least this many
+    # independent cross-segment matches agree on one relative transform.
+    link_min_matches: int = 3
+    # Keyframes of a segment sampled for cross-segment matching.
+    link_samples: int = 12
+    # Best coarse candidates per sampled keyframe that are refined.
+    link_candidates_per_sample: int = 3
+    # Matches agree if the segment positions they imply differ by less than
+    # this fraction of the diameter.
+    link_tolerance: float = 0.03
+    # Band along the outer specimen boundary excluded from cross-segment
+    # matching (fraction of the diameter).
+    link_edge_band: float = 0.05
+    # Minimal share of the field of view covered by specimen (after removing
+    # background and the edge band) for a keyframe to be used for linking.
+    link_min_content: float = 0.15
+    # Grey level below which pixels count as background around the specimen.
+    link_dark_level: float = 25.0
+    # Save CSV and overlap previews of cross-segment matches.
+    link_diagnostics: bool = True
+
     # --- rendering ---------------------------------------------------------
     # 'multiband' (best, slower), 'feather' (fast) or 'none' (hard seams).
     blending: str = "multiband"

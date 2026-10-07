@@ -79,19 +79,46 @@ def snake_path(x0, x1, y0, n_pass, pass_step, speed, pause_every=0):
 
 def make_video(path: str, width=1280, height=720, radius=380, seed=0,
                n_pass=4, speed=14.0, rot_deg=0.0, fps=30.0,
-               blur_prob=0.08, gt_path=None, specimen_size=(3600, 2400), jump=0):
+               blur_prob=0.08, gt_path=None, specimen_size=(3600, 2400), jump=0,
+               jumps=(), border=0.0, contrast=1.0, pass_step=0.62):
+    """jump: drop that many frames at 3/8 of the path (tracking loss);
+    jumps: list of (fraction of path, frames to drop);
+    border: black margin around the specimen (fraction of the FOV diameter),
+    so that the frames of the outer passes see the specimen edge."""
     rng = np.random.default_rng(seed + 1)
     sw, sh = specimen_size
     spec = make_specimen(sw, sh, seed)
+    if contrast != 1.0:
+        f = spec.astype(np.float32)
+        spec = (f.mean() + (f - f.mean()) * contrast).clip(0, 255).astype(np.uint8)
     cx, cy = width / 2 + 7.3, height / 2 - 4.1
     D = 2 * radius
-    pass_step = 0.62 * D
+    if border > 0:
+        b = int(border * D)
+        # slightly irregular outline of a polished section on black
+        pts = []
+        for x in np.linspace(b, sw - b, 25):
+            pts.append((x, b + rng.normal(0, 4)))
+        for y in np.linspace(b, sh - b, 17):
+            pts.append((sw - b + rng.normal(0, 4), y))
+        for x in np.linspace(sw - b, b, 25):
+            pts.append((x, sh - b + rng.normal(0, 4)))
+        for y in np.linspace(sh - b, b, 17):
+            pts.append((b + rng.normal(0, 4), y))
+        m = np.zeros((sh, sw), np.uint8)
+        cv2.fillPoly(m, [np.array(pts, np.int32)], 255, cv2.LINE_AA)
+        m = cv2.GaussianBlur(m.astype(np.float32) / 255, (0, 0), 1.5)[..., None]
+        spec = (spec.astype(np.float32) * m + 4.0).clip(0, 255).astype(np.uint8)
+    pass_step = pass_step * D
     margin = radius + 20
     path_xy = snake_path(margin, sw - margin, margin, n_pass, pass_step, speed, pause_every=90)
     if jump:
         # stage moved abruptly: drop `jump` frames in the middle of pass 2
         k0 = len(path_xy) * 3 // 8
         path_xy = path_xy[:k0] + path_xy[k0 + jump:]
+    for frac, n in sorted(jumps, reverse=True):
+        k0 = int(len(path_xy) * frac)
+        path_xy = path_xy[:k0] + path_xy[k0 + int(n):]
     yy, xx = np.mgrid[0:height, 0:width].astype(np.float32)
     rr = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
     circle = (rr <= radius).astype(np.float32)
@@ -141,8 +168,18 @@ if __name__ == "__main__":
     ap.add_argument("--rot", type=float, default=0.0)
     ap.add_argument("--passes", type=int, default=4)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--size", type=str, default="3600x2400", help="specimen WxH")
     ap.add_argument("--jump", type=int, default=0)
+    ap.add_argument("--jumps", type=str, default="",
+                    help="comma-separated frac:frames, e.g. 0.35:80,0.85:80")
+    ap.add_argument("--border", type=float, default=0.0)
+    ap.add_argument("--contrast", type=float, default=1.0)
+    ap.add_argument("--pass-step", type=float, default=0.62,
+                    help="distance between passes, fraction of the diameter")
     a = ap.parse_args()
     gt, circ, _ = make_video(a.out, gt_path=a.gt, rot_deg=a.rot, n_pass=a.passes, seed=a.seed,
-                            jump=a.jump)
+                            jump=a.jump, border=a.border, contrast=a.contrast, pass_step=a.pass_step,
+                            specimen_size=tuple(int(v) for v in a.size.split("x")),
+                            jumps=[tuple(float(v) for v in j.split(":"))
+                                   for j in a.jumps.split(",") if j])
     print(f"{len(gt)} frames, circle {circ}")

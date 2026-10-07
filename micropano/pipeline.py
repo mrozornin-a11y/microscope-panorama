@@ -38,6 +38,7 @@ class Result:
     n_used: int
     preview: Optional[np.ndarray] = None
     log: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
 
 
 class Pipeline:
@@ -99,6 +100,12 @@ class Pipeline:
             graph = PoseGraph(kfs, edges, reg, st)
             graph.run(self._stage("graph"), self.cancel)
             self.log.extend(graph.log)
+            for w in graph.warnings:
+                self._say("WARNING: " + w)
+            if st.link_diagnostics and graph.link_records:
+                from .diagnostics import write_link_diagnostics
+                p = write_link_diagnostics(self.out_dir, graph.link_records, kfs, reg)
+                self._say(f"cross-segment link diagnostics: {p}")
             t2 = time.time()
             self._say(f"pose graph: {len(graph.edges)} edges [{t2 - t1:.1f} s]")
             used = np.flatnonzero(graph.active)
@@ -135,7 +142,8 @@ class Pipeline:
             with open(os.path.join(self.out_dir, "log.txt"), "w", encoding="utf-8") as fh:
                 fh.write("\n".join(self.log) + "\n\nsettings:\n" + st.to_json() + "\n")
             return Result(tiff, prev, csv_path, renderer.width, renderer.height,
-                          len(kfs), len(used), preview, list(self.log))
+                          len(kfs), len(used), preview, list(self.log),
+                          list(graph.warnings))
         finally:
             if not st.keep_cache and not st.cache_dir:
                 shutil.rmtree(cache, ignore_errors=True)
