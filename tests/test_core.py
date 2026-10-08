@@ -409,3 +409,92 @@ def test_unlinked_component_saved(tmp_path):
     rows = list(csv.DictReader(open(res.csv_path)))
     assert sum(r["status"] == "unlinked" for r in rows) == c.n_keyframes
     assert all(r["component"] == "1" for r in rows if r["status"] == "unlinked")
+
+
+# ------------------------------------------------------- manual attachment
+def test_transform_from_points():
+    from micropano.merge import transform_from_points, apply_T
+    T = np.array([120.0, -40.0, math.radians(2.0)])
+    comp = np.array([[0.0, 0.0], [500.0, 30.0], [100.0, 400.0]])
+    main = np.array([apply_T(T, [*p, 0.0])[:2] for p in comp])
+    est, rms = transform_from_points(main, comp)
+    assert np.allclose(est, T, atol=1e-9) and rms < 1e-9
+    est1, _ = transform_from_points(main[:1], comp[:1])        # 1 pair: shift only
+    assert est1[2] == 0.0 and np.allclose(est1[:2], main[0] - comp[0])
+
+
+def test_manual_attach_refine_and_merge(tmp_path):
+    import csv
+    import hashlib
+    from micropano.merge import MergeSession
+    from micropano.pipeline import Pipeline
+    from tests.synthetic import make_video
+
+    video = str(tmp_path / "v.mp4")
+    gtp = str(tmp_path / "gt.csv")
+    make_video(video, width=640, height=360, radius=190, n_pass=3, speed=9.0, gt_path=gtp,
+               specimen_size=(1500, 900), seed=6, border=0.3, jumps=[(0.5, 45)])
+    out = str(tmp_path / "out")
+    # automatic linking made impossible -> unlinked components that do overlap
+    st = Settings(blending="feather", link_min_matches=99, link_verify_min=99)
+    res = Pipeline(video, out, st).run()
+    assert res.components and res.merge_dir and MergeSession.available(out)
+    gt = {int(r["frame"]): np.array([float(r["x"]), float(r["y"])])
+          for r in csv.DictReader(open(gtp))}
+    ses = MergeSession(out)
+    c = max(ses.unlinked(), key=lambda k: len(ses.comp_ids(k)))
+
+    def true_T(c):
+        a = np.mean([ses.world_pose(i)[:2] - gt[ses.frames[i]["frame"]]
+                     for i in ses.main_ids()], 0)
+        b = np.mean([ses.pose(i)[:2] - gt[ses.frames[i]["frame"]] for i in ses.comp_ids(c)], 0)
+        return np.array([*(a - b), 0.0])
+
+    Tt = true_T(c)
+    # far away: no overlap, nothing to confirm
+    far = ses.refine(c, Tt + [5 * ses.D, 0, 0])
+    assert not far.confirmed and far.n_matched == 0
+    # rough manual position: refined to the true one and confirmed
+    r = ses.refine(c, Tt + [0.12 * ses.D, -0.08 * ses.D, math.radians(1.0)], 0.3)
+    assert r.confirmed and r.n_consistent >= 2
+    assert np.linalg.norm(r.T[:2] - Tt[:2]) < 1.0 and abs(r.T[2]) < math.radians(0.05)
+
+    h = hashlib.md5(open(res.tiff_path, "rb").read()).hexdigest()
+    mo = ses.merge(c, r.T, "registered", r.summary())
+    assert os.path.exists(mo.tiff_path) and os.path.basename(mo.tiff_path) == "mosaic_merged.tif"
+    assert hashlib.md5(open(res.tiff_path, "rb").read()).hexdigest() == h   # untouched
+    rows = list(csv.DictReader(open(mo.csv_path)))
+    used = [r_ for r_ in rows if r_["status"] in ("used", "merged")]
+    assert sum(r_["status"] == "merged" for r_ in rows) == len(ses.comp_ids(c))
+    est = np.array([[float(r_["x"]), float(r_["y"])] for r_ in used])
+    ref = np.array([gt[int(r_["frame"])] for r_ in used])
+    e = (est - est.mean(0)) - (ref - ref.mean(0))
+    assert np.sqrt((e ** 2).sum(1).mean()) < 0.5
+
+    # state survives re-opening
+    ses2 = MergeSession(out)
+    assert ses2.comp_status(c)["status"] == "merged"
+    assert c not in ses2.unlinked()
+
+
+def test_manual_attach_manual_position(tmp_path):
+    """Merging without confirmed registration is allowed but marked."""
+    import csv
+    from micropano.merge import MergeSession
+    from micropano.pipeline import Pipeline
+    from tests.synthetic import make_video
+
+    video = str(tmp_path / "v.mp4")
+    make_video(video, width=640, height=360, radius=190, n_pass=2, speed=9.0,
+               specimen_size=(1500, 900), seed=6, border=0.3, jumps=[(0.6, 45)])
+    out = str(tmp_path / "out")
+    st = Settings(blending="feather", link_min_matches=99, link_verify_min=99)
+    res = Pipeline(video, out, st).run()
+    assert res.components
+    ses = MergeSession(out)
+    c = ses.unlinked()[0]
+    mo = ses.merge(c, [10.0, 2000.0, 0.0], "manual", "manual position")
+    rows = list(csv.DictReader(open(mo.csv_path)))
+    assert sum(r["status"] == "merged-manual" for r in rows) == len(ses.comp_ids(c))
+    assert "MANUALLY POSITIONED" in open(os.path.join(out, "merge_log.txt")).read()
+    assert MergeSession(out).comp_status(c)["method"] == "manual"

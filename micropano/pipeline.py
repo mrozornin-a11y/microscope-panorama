@@ -40,6 +40,8 @@ class Result:
     log: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
     components: List["Component"] = field(default_factory=list)
+    out_dir: str = ""
+    merge_dir: Optional[str] = None      # set when components can be attached manually
 
 
 @dataclass
@@ -173,6 +175,7 @@ class Pipeline:
             bounds = np.concatenate([[0], np.cumsum(areas) / areas.sum()])
             a0, a1 = _STAGES["render"]
             renderers = {}
+            previews = {}
             comps = []
             preview = None
             for k, (c, ids, r, tiff, prev) in enumerate(jobs):
@@ -186,6 +189,7 @@ class Pipeline:
                           f"{os.path.relpath(tiff, self.out_dir)}")
                 pv = r.render(tiff, prev, prog, self.cancel)
                 renderers[c] = r
+                previews[c] = pv
                 if c == 0:
                     preview, main_r = pv, r
                 else:
@@ -199,6 +203,16 @@ class Pipeline:
 
             csv_path = os.path.join(self.out_dir, "frame_positions.csv")
             self._write_csv(csv_path, kfs, graph, poses, renderers)
+            merge_dir = None
+            if comps and st.keep_merge_data:
+                from .merge import save_merge_state
+                q, _ = graph.frame_quality()
+                merge_dir = save_merge_state(
+                    self.out_dir, self.video_path, fov, st, kfs, graph.comp, poses, q,
+                    renderers, {c: (t, p) for c, _, _, t, p in jobs}, previews, gain,
+                    {c.index: c.reason for c in comps})
+                self._say(f"keyframes for manual attachment kept in "
+                          f"{os.path.relpath(merge_dir, self.out_dir)}/")
             for w in self.warnings[len(graph.warnings):]:
                 self._say("WARNING: " + w)
             self._say(f"done in {time.time() - t0:.1f} s")
@@ -206,7 +220,7 @@ class Pipeline:
                 fh.write("\n".join(self.log) + "\n\nsettings:\n" + st.to_json() + "\n")
             return Result(jobs[0][3], jobs[0][4], csv_path, main_r.width, main_r.height,
                           len(kfs), len(used), preview, list(self.log),
-                          list(self.warnings), comps)
+                          list(self.warnings), comps, self.out_dir, merge_dir)
         finally:
             if not st.keep_cache and not st.cache_dir:
                 shutil.rmtree(cache, ignore_errors=True)

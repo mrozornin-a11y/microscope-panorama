@@ -12,7 +12,7 @@ import numpy as np
 from PySide6.QtCore import QObject, QPointF, QRectF, Qt, QThread, QUrl, Signal
 from PySide6.QtGui import QAction, QBrush, QColor, QDesktopServices, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
+    QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout,
     QGraphicsEllipseItem, QGraphicsLineItem, QGraphicsPixmapItem, QGraphicsScene,
     QGraphicsView, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
     QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSpinBox, QSplitter,
@@ -142,24 +142,22 @@ class CircleView(ImageView):
 
 # --------------------------------------------------------------------------
 class Worker(QObject):
+    """Runs fn(progress, cancel) in a thread."""
     progress = Signal(float, str)
     finished = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, video, out_dir, settings, fov):
+    def __init__(self, fn):
         super().__init__()
-        self.args = (video, out_dir, settings, fov)
+        self.fn = fn
         self._cancel = False
 
     def cancel(self):
         self._cancel = True
 
     def run(self):
-        video, out_dir, settings, fov = self.args
         try:
-            res = Pipeline(video, out_dir, settings, fov,
-                           progress=lambda f, m: self.progress.emit(f, m),
-                           cancel=lambda: self._cancel).run()
+            res = self.fn(lambda f, m: self.progress.emit(f, m), lambda: self._cancel)
             self.finished.emit(res)
         except InterruptedError:
             self.failed.emit("Cancelled")
@@ -317,6 +315,8 @@ class MainWindow(QMainWindow):
         self.thread = None
         self.worker = None
         self.result = None
+        self.session = None
+        self._entries = []
 
         # left: controls
         left = QWidget()
@@ -324,6 +324,11 @@ class MainWindow(QMainWindow):
         self.btn_open = QPushButton("Open video…")
         self.btn_open.clicked.connect(self.open_video)
         ll.addWidget(self.btn_open)
+        self.btn_open_res = QPushButton("Open result folder…")
+        self.btn_open_res.setToolTip("Re-open a processed output folder, e.g. to attach "
+                                     "unlinked components later")
+        self.btn_open_res.clicked.connect(self.open_result_folder)
+        ll.addWidget(self.btn_open_res)
         self.lbl_video = QLabel("No video loaded")
         self.lbl_video.setWordWrap(True)
         ll.addWidget(self.lbl_video)
@@ -425,7 +430,14 @@ class MainWindow(QMainWindow):
         self.btn_folder = QPushButton("Open output folder")
         self.btn_folder.setEnabled(False)
         self.btn_folder.clicked.connect(self.open_folder)
+        self.lbl_result.setWordWrap(True)
+        self.btn_attach = QPushButton("Attach to main mosaic…")
+        self.btn_attach.setToolTip("Position the selected unlinked component manually, refine "
+                                   "it automatically and merge it into mosaic_merged.tif")
+        self.btn_attach.setEnabled(False)
+        self.btn_attach.clicked.connect(self.attach_component)
         rrow.addWidget(self.lbl_result, 1)
+        rrow.addWidget(self.btn_attach)
         rrow.addWidget(self.btn_folder)
         rl.addLayout(rrow)
         self.log = QPlainTextEdit()
@@ -521,12 +533,17 @@ class MainWindow(QMainWindow):
         self.log.clear()
         self.progress.setValue(0)
         self._busy(True)
+        path = self.video.path
+        self._start(lambda prog, cancel: Pipeline(path, out, st, fov, prog, cancel).run(),
+                    self._on_done)
+
+    def _start(self, fn, on_done):
         self.thread = QThread()
-        self.worker = Worker(self.video.path, out, st, fov)
+        self.worker = Worker(fn)
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
         self.worker.progress.connect(self._on_progress)
-        self.worker.finished.connect(self._on_done)
+        self.worker.finished.connect(on_done)
         self.worker.failed.connect(self._on_failed)
         self.worker.finished.connect(self.thread.quit)
         self.worker.failed.connect(self.thread.quit)
@@ -538,9 +555,15 @@ class MainWindow(QMainWindow):
             self.lbl_status.setText("Cancelling…")
 
     def _busy(self, on):
-        for w in (self.btn_build, self.btn_open, self.btn_detect, self.panel):
+        for w in (self.btn_build, self.btn_open, self.btn_detect, self.panel,
+                  self.btn_open_res, self.cmb_result):
             w.setEnabled(not on)
         self.btn_cancel.setEnabled(on)
+        if on:
+            self.btn_attach.setEnabled(False)
+        else:
+            self.btn_build.setEnabled(self.video is not None)
+            self._update_attach()
 
     def _on_progress(self, f, msg):
         self.progress.setValue(int(f * 1000))
@@ -557,40 +580,147 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Mosaic built with warnings",
                                 "\n\n".join(res.warnings) +
                                 "\n\nSee the Log tab and diagnostics/segment_links.csv.")
-        self.cmb_result.blockSignals(True)
-        self.cmb_result.clear()
-        self.cmb_result.addItem(f"Main mosaic — {res.n_used} keyframes, "
-                                f"{res.width} × {res.height} px")
-        for c in res.components:
-            self.cmb_result.addItem(f"Unlinked component {c.index} — {c.n_keyframes} keyframes, "
-                                    f"frames {c.first_frame}–{c.last_frame}")
-        self.cmb_result.blockSignals(False)
-        if res.components:
-            n = sum(c.n_keyframes for c in res.components)
-            self.lbl_unlinked.setText(
-                f"{len(res.components)} component(s) with {n} keyframes could not be linked "
-                f"to the main mosaic and were saved separately in 'unlinked/'. "
-                f"Select them above to inspect.")
-        self.lbl_unlinked.setVisible(bool(res.components))
-        self.cmb_result.setCurrentIndex(0)
-        self._show_result_item(0)
+        self.session = None
+        if res.merge_dir:
+            try:
+                from .merge import MergeSession
+                self.session = MergeSession(res.out_dir)
+            except Exception as e:  # noqa: BLE001
+                self.log.appendPlainText(f"merge data unavailable: {e}")
+        if self.session is not None:
+            self._entries_from_session()
+        else:
+            self._entries = [dict(kind="main", c=0, img=res.preview, path=res.tiff_path,
+                                  w=res.width, h=res.height, note="",
+                                  title=f"Main mosaic — {res.n_used} keyframes, "
+                                        f"{res.width} × {res.height} px")]
+            for c in res.components:
+                self._entries.append(dict(
+                    kind="comp", c=c.index, img=c.preview, path=c.tiff_path, w=c.width,
+                    h=c.height, status="unlinked",
+                    note=f" — not linked: {c.reason}" if c.reason else "",
+                    title=f"Unlinked component {c.index} — {c.n_keyframes} keyframes, "
+                          f"frames {c.first_frame}–{c.last_frame}"))
+        self._fill_combo()
         self.btn_folder.setEnabled(True)
         self.tabs.setCurrentIndex(1)
 
+    # ----------------------------------------------------------- result list
+    def _entries_from_session(self):
+        ses = self.session
+        o = ses.output(None)
+        merged = ses.state["main_output"] == "merged"
+        n_main = len(ses.main_ids())
+        self._entries = [dict(
+            kind="main", c=0, img=ses.preview_image(None),
+            path=os.path.join(ses.out_dir, o["tiff"]), w=o["width"], h=o["height"], note="",
+            title=(f"Merged mosaic (mosaic_merged.tif) — {n_main} keyframes"
+                   if merged else f"Main mosaic — {n_main} keyframes, "
+                                  f"{o['width']} × {o['height']} px"))]
+        for c in sorted(int(k) for k in ses.state["components"] if k != "0"):
+            v = ses.comp_status(c)
+            oc = ses.output(c)
+            if v["status"] == "merged":
+                how = "registered" if v["method"] == "registered" else "MANUALLY POSITIONED"
+                title = f"Component {c} — merged ({how})"
+                note = f" — merged into mosaic_merged.tif ({how})"
+            else:
+                title = f"Unlinked component {c} — {ses.frame_info(c)}"
+                note = f" — not linked: {v.get('reason', '')}"
+            self._entries.append(dict(
+                kind="comp", c=c, img=ses.preview_image(c), status=v["status"],
+                path=os.path.join(ses.out_dir, oc["tiff"]), w=oc["width"], h=oc["height"],
+                note=note, title=title))
+
+    def _fill_combo(self, select: int = 0):
+        self.cmb_result.blockSignals(True)
+        self.cmb_result.clear()
+        for e in self._entries:
+            self.cmb_result.addItem(e["title"])
+        self.cmb_result.blockSignals(False)
+        unl = [e for e in self._entries if e.get("status") == "unlinked"]
+        if unl:
+            self.lbl_unlinked.setText(
+                f"{len(unl)} component(s) could not be linked to the main mosaic and were "
+                f"saved separately in 'unlinked/'. Select one above to inspect"
+                + (" or attach it manually." if self.session is not None else "."))
+        self.lbl_unlinked.setVisible(bool(unl))
+        self.cmb_result.setCurrentIndex(select)
+        self._show_result_item(select)
+
     def _show_result_item(self, idx):
-        res = self.result
-        if res is None or idx < 0:
+        if not getattr(self, "_entries", None) or idx < 0 or idx >= len(self._entries):
             return
-        if idx == 0:
-            img, path, w, h, note = res.preview, res.tiff_path, res.width, res.height, ""
+        e = self._entries[idx]
+        if e["img"] is not None:
+            self.view_result.set_image(e["img"])
+        self.lbl_result.setText(f"{os.path.basename(e['path'])}: {e['w']} × {e['h']} px"
+                                f"{e['note']}")
+        self.lbl_result.setToolTip(e["path"])
+        self._update_attach()
+
+    def _update_attach(self):
+        idx = self.cmb_result.currentIndex()
+        ok = (self.session is not None and getattr(self, "_entries", None) and
+              0 <= idx < len(self._entries) and
+              self._entries[idx].get("status") == "unlinked")
+        self.btn_attach.setEnabled(bool(ok))
+
+    # --------------------------------------------------------------- attach
+    def attach_component(self):
+        idx = self.cmb_result.currentIndex()
+        c = self._entries[idx]["c"]
+        from .attach_gui import AttachDialog
+        dlg = AttachDialog(self.session, c, self)
+        if dlg.exec() != QDialog.Accepted or dlg.decision is None:
+            return
+        d = dlg.decision
+        ses = self.session
+        self.lbl_status.setText(f"Merging component {c} ({d['method']})…")
+        self.progress.setValue(0)
+        self._busy(True)
+        self._merging = (c, d["method"])
+        self._start(lambda prog, cancel: ses.merge(c, d["T"], d["method"], d["quality"],
+                                                   prog, cancel), self._on_merged)
+
+    def _on_merged(self, out):
+        self._busy(False)
+        c, method = self._merging
+        self.progress.setValue(1000)
+        tag = "registered" if method == "registered" else "MANUALLY POSITIONED"
+        self.lbl_status.setText(f"Component {c} merged ({tag}) → mosaic_merged.tif "
+                                f"{out.width} × {out.height} px")
+        self.log.appendPlainText(f"component {c} merged ({tag}) -> {out.tiff_path}")
+        self._entries_from_session()
+        self._fill_combo(0)
+
+    def open_result_folder(self):
+        d = QFileDialog.getExistingDirectory(self, "Processed output folder")
+        if d:
+            self.load_result_folder(d)
+
+    def load_result_folder(self, d: str):
+        from .merge import MergeSession
+        if not MergeSession.available(d):
+            img = os.path.join(d, "preview.jpg")
+            if not os.path.exists(img):
+                QMessageBox.warning(self, "Open result", "No mosaic found in this folder.")
+                return
+            QMessageBox.information(self, "Open result",
+                                    "This folder has no unlinked components that can be "
+                                    "attached (no merge_data). Showing the preview only.")
+            pv = cv2.imread(img)
+            self.session = None
+            self._entries = [dict(kind="main", c=0, img=pv, path=os.path.join(d, "mosaic.tif"),
+                                  w=0, h=0, note="", title="Main mosaic")]
         else:
-            c = res.components[idx - 1]
-            img, path, w, h = c.preview, c.tiff_path, c.width, c.height
-            note = f" — not linked: {c.reason}" if c.reason else ""
-        if img is not None:
-            self.view_result.set_image(img)
-        self.lbl_result.setText(f"{os.path.basename(path)}: {w} × {h} px{note}")
-        self.lbl_result.setToolTip(path)
+            self.session = MergeSession(d)
+            self._entries_from_session()
+        self.result = None
+        self.btn_folder.setEnabled(True)
+        self._result_dir = d
+        self._fill_combo(0)
+        self.tabs.setCurrentIndex(1)
 
     def _on_failed(self, msg):
         self._busy(False)
@@ -600,8 +730,11 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Mosaic failed", msg.splitlines()[0])
 
     def open_folder(self):
-        if self.result:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(self.result.tiff_path)))
+        d = (self.session.out_dir if self.session is not None else
+             os.path.dirname(self.result.tiff_path) if self.result else
+             getattr(self, "_result_dir", None))
+        if d:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(d))
 
     def closeEvent(self, ev):
         if self.thread is not None and self.thread.isRunning():

@@ -100,6 +100,12 @@ class Settings:
     # they have at least this many keyframes (smaller ones are dropped).
     save_unlinked: bool = True
     min_component_keyframes: int = 3
+    # Keep keyframes and poses in <out>/merge_data when there are unlinked
+    # components, so that they can be attached manually later.
+    keep_merge_data: bool = True
+    # Manual attachment: the refined position counts as confirmed when at
+    # least this many locally registered frame pairs agree with it.
+    manual_min_pairs: int = 2
 
     # --- rendering ---------------------------------------------------------
     # 'multiband' (best, slower), 'feather' (fast) or 'none' (hard seams).
