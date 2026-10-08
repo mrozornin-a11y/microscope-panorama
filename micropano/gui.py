@@ -406,6 +406,19 @@ class MainWindow(QMainWindow):
         res_w = QWidget()
         rl = QVBoxLayout(res_w)
         rl.setContentsMargins(0, 0, 0, 0)
+        crow = QHBoxLayout()
+        crow.addWidget(QLabel("Show:"))
+        self.cmb_result = QComboBox()
+        self.cmb_result.setToolTip("Main mosaic, or a component that could not be linked "
+                                   "to it (saved as a separate TIFF in 'unlinked/').")
+        self.cmb_result.currentIndexChanged.connect(self._show_result_item)
+        crow.addWidget(self.cmb_result, 1)
+        rl.addLayout(crow)
+        self.lbl_unlinked = QLabel("")
+        self.lbl_unlinked.setWordWrap(True)
+        self.lbl_unlinked.setStyleSheet("color: #c0392b")
+        self.lbl_unlinked.setVisible(False)
+        rl.addWidget(self.lbl_unlinked)
         rl.addWidget(self.view_result)
         rrow = QHBoxLayout()
         self.lbl_result = QLabel("")
@@ -544,11 +557,40 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Mosaic built with warnings",
                                 "\n\n".join(res.warnings) +
                                 "\n\nSee the Log tab and diagnostics/segment_links.csv.")
-        if res.preview is not None:
-            self.view_result.set_image(res.preview)
-        self.lbl_result.setText(f"mosaic.tif: {res.width} × {res.height} px")
+        self.cmb_result.blockSignals(True)
+        self.cmb_result.clear()
+        self.cmb_result.addItem(f"Main mosaic — {res.n_used} keyframes, "
+                                f"{res.width} × {res.height} px")
+        for c in res.components:
+            self.cmb_result.addItem(f"Unlinked component {c.index} — {c.n_keyframes} keyframes, "
+                                    f"frames {c.first_frame}–{c.last_frame}")
+        self.cmb_result.blockSignals(False)
+        if res.components:
+            n = sum(c.n_keyframes for c in res.components)
+            self.lbl_unlinked.setText(
+                f"{len(res.components)} component(s) with {n} keyframes could not be linked "
+                f"to the main mosaic and were saved separately in 'unlinked/'. "
+                f"Select them above to inspect.")
+        self.lbl_unlinked.setVisible(bool(res.components))
+        self.cmb_result.setCurrentIndex(0)
+        self._show_result_item(0)
         self.btn_folder.setEnabled(True)
         self.tabs.setCurrentIndex(1)
+
+    def _show_result_item(self, idx):
+        res = self.result
+        if res is None or idx < 0:
+            return
+        if idx == 0:
+            img, path, w, h, note = res.preview, res.tiff_path, res.width, res.height, ""
+        else:
+            c = res.components[idx - 1]
+            img, path, w, h = c.preview, c.tiff_path, c.width, c.height
+            note = f" — not linked: {c.reason}" if c.reason else ""
+        if img is not None:
+            self.view_result.set_image(img)
+        self.lbl_result.setText(f"{os.path.basename(path)}: {w} × {h} px{note}")
+        self.lbl_result.setToolTip(path)
 
     def _on_failed(self, msg):
         self._busy(False)

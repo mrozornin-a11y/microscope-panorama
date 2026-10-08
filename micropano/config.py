@@ -82,8 +82,24 @@ class Settings:
     link_min_content: float = 0.15
     # Grey level below which pixels count as background around the specimen.
     link_dark_level: float = 25.0
+    # Anchor verification: a single good cross-segment match is only a
+    # hypothesis; this many neighbouring frame pairs (predicted from it) are
+    # registered locally, and at least link_verify_min of them must confirm
+    # the same transform within link_tolerance.
+    link_verify_pairs: int = 4
+    link_verify_min: int = 2
+    # Local gap recovery between temporally adjacent tracking segments:
+    # search radius around the position extrapolated from the stage motion
+    # before the loss (fraction of the diameter), and how many keyframes on
+    # each side of the gap are tried.
+    link_gap_window: float = 0.35
+    link_gap_keyframes: int = 3
     # Save CSV and overlap previews of cross-segment matches.
     link_diagnostics: bool = True
+    # Components that could not be linked are rendered as separate TIFFs if
+    # they have at least this many keyframes (smaller ones are dropped).
+    save_unlinked: bool = True
+    min_component_keyframes: int = 3
 
     # --- rendering ---------------------------------------------------------
     # 'multiband' (best, slower), 'feather' (fast) or 'none' (hard seams).

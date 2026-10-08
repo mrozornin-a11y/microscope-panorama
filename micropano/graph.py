@@ -212,6 +212,10 @@ class PoseGraph:
         self.log: List[str] = []
         self.warnings: List[str] = []
         self.link_records: List[dict] = []
+        self.unlinked_reasons: Dict[Tuple[int, ...], str] = {}
+        self.comp = np.zeros(self.n, int)       # 0 = main, k>0 unlinked, -1 dropped
+        self.kept = np.zeros(self.n, bool)
+        self._prev_lab: Optional[np.ndarray] = None
         self.threads = settings.threads or None
 
     # ------------------------------------------------------------------
@@ -242,15 +246,26 @@ class PoseGraph:
     def link_segments(self, progress=None, cancel=None):
         """Re-attach components disconnected by tracking failures.
 
-        A segment is attached only when at least `link_min_matches`
-        independent cross-segment matches agree on one rigid transform between
-        the segment and the main component; otherwise it is left out (and a
-        warning is issued) rather than placed at a possibly wrong position.
+        1. Local gap recovery for temporally adjacent tracking segments: the
+           stage motion before the loss predicts where the next segment
+           starts; a few keyframes on both sides of the gap are registered in
+           an enlarged window around that prediction.
+        2. General cross-segment search of the remaining components against
+           the main component (specimen-only global correlation).
+
+        Any single match is only an anchor hypothesis.  A component is
+        attached if either `link_min_matches` independent matches of the
+        search agree, or the anchor is confirmed by local registration of
+        `link_verify_min` neighbouring frame pairs predicted from it.
+        Otherwise the component is kept separately and a warning is issued.
         """
         if self.n == 0:
             return
+        self._attempt = getattr(self, "_attempt", 0)
+        self.unlinked_reasons: Dict[Tuple[int, ...], str] = {}
+        self._gap_recovery(progress, cancel)
+
         failed: Dict[Tuple[int, ...], Tuple[int, str]] = {}
-        comp_no = 0
         while True:
             main = self._main_component()
             if len(main) == self.n:
@@ -265,10 +280,9 @@ class PoseGraph:
                 key = tuple(int(m) for m in members)
                 if key in failed and failed[key][0] == len(main):
                     continue          # nothing changed since the last attempt
-                comp_no += 1
                 if progress:
                     progress(0.0, f"Linking segment of {len(members)} keyframes")
-                ok, reason = self._try_link(members, main, P, comp_no, cancel)
+                ok, reason = self._try_link(members, main, P, cancel)
                 if ok:
                     self.log.append(reason)
                     linked = True
@@ -284,31 +298,289 @@ class PoseGraph:
             members = np.flatnonzero(lab == c)
             if lab[main[0]] == c:
                 continue
-            reason = failed.get(tuple(int(m) for m in members), (0, "not attempted"))[1]
-            if len(members) < self.st.link_min_matches:
+            key = tuple(int(m) for m in members)
+            reason = failed.get(key, (0, "not attempted"))[1]
+            self.unlinked_reasons[key] = reason
+            if len(members) < self.st.min_component_keyframes:
                 small += len(members)
                 continue
             f0, f1 = self.kf[members[0]].frame_index, self.kf[members[-1]].frame_index
             self.warnings.append(
                 f"tracking segment of {len(members)} keyframes (video frames {f0}-{f1}) "
-                f"was NOT linked to the mosaic: {reason}")
+                f"was NOT linked to the main mosaic: {reason}")
         if small:
             self.warnings.append(f"{small} keyframes in very short tracking segments "
-                                 f"were not linked to the mosaic")
+                                 f"were not linked and are dropped")
 
-    def _try_link(self, members: np.ndarray, main: np.ndarray, P: np.ndarray,
-                  comp_no: int, cancel=None) -> Tuple[bool, str]:
+    # ------------------------------------------------------------------
+    def _candidate(self, m, s, rel, cm, P, source):
+        """Match of segment keyframe s to main keyframe m and the transform
+        (segment frame -> main frame) it implies."""
+        th = P[m, 2] + rel.phi
+        t = P[m, :2] + _rot(P[m, 2]) @ np.array([rel.dx, rel.dy])
+        thT = th - P[s, 2]
+        tT = t - _rot(thT) @ P[s, :2]
+        return dict(m=int(m), s=int(s), rel=rel, cm=cm, th=thT, t=tT, source=source,
+                    res=float("nan"))
+
+    def _record(self, attempt, seg_size, c, status):
+        nan = float("nan")
+        cm, rel = c.get("cm"), c["rel"]
+        self.link_records.append(dict(
+            attempt=attempt, segment_size=seg_size, source=c["source"],
+            main_kf=c["m"], seg_kf=c["s"],
+            main_frame=self.kf[c["m"]].frame_index, seg_frame=self.kf[c["s"]].frame_index,
+            ncc=cm.peak if cm is not None else nan,
+            second_peak=cm.second if cm is not None else nan,
+            quality=rel.quality if c.get("measured", True) else nan,
+            overlap=rel.overlap if c.get("measured", True) else nan,
+            tx=c["t"][0], ty=c["t"][1], rot_deg=math.degrees(c["th"]),
+            residual_px=c["res"], status=status, rel=rel,
+            predicted=not c.get("measured", True)))
+
+    def _verify(self, anchor, main_nodes, seg_nodes, P, cancel=None):
+        """Predict neighbouring frame pairs from the anchor's transform and
+        register them locally.  Returns (confirmations, tested pairs)."""
         st, reg = self.st, self.reg
+        tol = st.link_tolerance * self.D
+        thT, tT = anchor["th"], anchor["t"]
+        R = _rot(thT)
+        main_nodes = [int(m) for m in main_nodes]
+        mpos = P[main_nodes, :2]
+        # segment keyframes closest (in time) to the anchor, anchor included
+        seg_near = sorted((int(s) for s in seg_nodes),
+                          key=lambda s: abs(s - anchor["s"]))[:3 * st.link_verify_pairs]
+        dmax = max_pair_distance(self.D, 1.5 * st.min_overlap_area)
+        options = []
+        for s in seg_near:
+            ps = R @ P[s, :2] + tT
+            d = np.linalg.norm(mpos - ps, axis=1)
+            for k in np.flatnonzero(d < dmax):
+                m = main_nodes[k]
+                if m == anchor["m"] and s == anchor["s"]:
+                    continue
+                # prefer pairs that share no image with the anchor, then
+                # pairs close to the anchor in time and with large overlap
+                shared = int(m == anchor["m"]) + int(s == anchor["s"])
+                options.append((shared, abs(s - anchor["s"]), float(d[k]), m, s, ps))
+        options.sort(key=lambda o: o[:3])
+        pairs, per_s, used = [], {}, set()
+        for shared, _, _, m, s, ps in options:
+            if per_s.get(s, 0) >= 2 or (m, s) in used:
+                continue
+            pairs.append((m, s, ps))
+            per_s[s] = per_s.get(s, 0) + 1
+            used.add((m, s))
+            if len(pairs) >= st.link_verify_pairs:
+                break
+        conf, tested = [], []
+        for m, s, ps in pairs:
+            if cancel and cancel():
+                raise InterruptedError
+            dpred = _rot(P[m, 2]).T @ (ps - P[m, :2])
+            pred = RelPose(float(dpred[0]), float(dpred[1]), float(thT + P[s, 2] - P[m, 2]))
+            cm, rel = reg.link_local(self.kf[m].prep, self.kf[s].prep, pred,
+                                     st.link_tolerance)
+            c = self._candidate(m, s, rel if rel is not None else pred, cm, P, "verify")
+            c["measured"] = rel is not None
+            if rel is not None:
+                c["res"] = float(math.hypot(rel.dx - pred.dx, rel.dy - pred.dy))
+            if rel is not None and c["res"] <= tol:
+                conf.append(c)
+            tested.append(c)
+        return conf, tested
+
+    def _decide(self, cands, main_nodes, seg_nodes, P, seg_size, cancel=None,
+                what="segment") -> Tuple[bool, str]:
+        """Accept a link between two components from candidate matches."""
+        st = self.st
+        self._attempt += 1
+        attempt = self._attempt
         need = max(1, int(st.link_min_matches))
+        need_v = max(1, int(st.link_verify_min))
         tol = st.link_tolerance * self.D
         rot_tol = math.radians(max(1.0, st.max_rotation_deg))
-        if len(members) < need:
-            return False, f"segment shorter than {need} keyframes"
+        if not cands:
+            return False, "no reliable specimen match found"
+        centre = np.nanmean(P[list(seg_nodes), :2], axis=0)
+
+        def mapped(c):
+            return _rot(c["th"]) @ centre + c["t"]
+
+        def agree(a, b):
+            return (abs(a["th"] - b["th"]) < rot_tol and
+                    np.linalg.norm(mapped(a) - mapped(b)) < tol)
+
+        def support(group):
+            """Independent matches: distinct, non-adjacent keyframes on both
+            sides."""
+            def count(ids):
+                n, last = 0, None
+                for i in sorted(set(ids)):
+                    if last is None or i - last >= 2:
+                        n += 1
+                        last = i
+                return n
+            return min(count(c["s"] for c in group), count(c["m"] for c in group))
+
+        def best_cluster(pool):
+            best, best_key = [], (0, 0.0)
+            for c in pool:
+                grp = [d for d in pool if agree(c, d)]
+                key = (support(grp), sum(d["rel"].quality for d in grp))
+                if key > best_key:
+                    best, best_key = grp, key
+            return best, best_key[0]
+
+        def residuals(group, pool):
+            thT = float(np.mean([c["th"] for c in group]))
+            cT = np.mean([mapped(c) for c in group], axis=0)
+            tT = cT - _rot(thT) @ centre
+            for c in pool:
+                c["res"] = float(np.linalg.norm(
+                    _rot(thT) @ P[c["s"], :2] + tT - (_rot(c["th"]) @ P[c["s"], :2] + c["t"])))
+
+        def accept(group, extra, how):
+            uniq, seen = [], set()
+            for c in group:                    # one edge per frame pair
+                if (c["m"], c["s"]) not in seen:
+                    seen.add((c["m"], c["s"]))
+                    uniq.append(c)
+            group[:] = uniq
+            done = []
+            for c in cands + extra:
+                if any(c is d for d in group):
+                    if any(c is d for d in done):
+                        continue
+                    done.append(c)
+                    self._record(attempt, seg_size, c, "accepted")
+                    self.edges.append(Edge(c["m"], c["s"], c["rel"], "link"))
+                    self.tested.add((min(c["m"], c["s"]), max(c["m"], c["s"])))
+                elif c.get("measured", True):
+                    self._record(attempt, seg_size, c,
+                                 "outlier" if c["source"] != "verify" else "verify-failed")
+                else:
+                    self._record(attempt, seg_size, c, "verify-failed")
+            resid = max(c["res"] for c in group)
+            return True, (f"{what} of {seg_size} keyframes linked {how}; "
+                          f"{len(group)} matches, max residual {resid:.1f} px: "
+                          + ", ".join(f"{c['m']}-{c['s']}" for c in group[:8])
+                          + (" ..." if len(group) > 8 else ""))
+
+        # (a) independent consensus of the search results
+        inl, sup = best_cluster(cands)
+        residuals(inl, cands)
+        inl = [c for c in inl if c["res"] <= tol]
+        sup = support(inl)
+        rest = [c for c in cands if not any(c is d for d in inl)]
+        rival, rival_sup = best_cluster(rest)
+        if sup >= need and rival_sup < need:
+            return accept(inl, [], f"by {sup} independent matches")
+
+        # (b) anchor hypotheses verified by predicted neighbouring pairs
+        anchors = sorted(cands, key=lambda c: -(c["rel"].quality * max(c["rel"].ncc, 0.01)))
+        verified = []          # (anchor group, confirmations)
+        all_tested = []
+        for a in anchors[:6]:
+            if any(agree(a, g[0][0]) for g in verified):
+                continue      # same hypothesis already verified
+            conf, tested = self._verify(a, main_nodes, seg_nodes, P, cancel)
+            all_tested += tested
+            if len(conf) >= need_v and len(conf) >= 0.5 * len(tested):
+                group = [a] + [c for c in cands if c is not a and agree(a, c)] + conf
+                verified.append((group, conf))
+        if len(verified) == 1:
+            group, conf = verified[0]
+            residuals([group[0]], [c for c in group if c["source"] != "verify"])
+            group = [c for c in group if c["res"] <= tol]
+            return accept(group, all_tested,
+                          f"by anchor {group[0]['m']}-{group[0]['s']} confirmed by "
+                          f"{len(conf)} neighbouring pair(s)")
+        for c in cands:
+            self._record(attempt, seg_size, c, "rejected")
+        for c in all_tested:
+            self._record(attempt, seg_size, c, "verify-failed")
+        if len(verified) > 1:
+            return False, (f"ambiguous: {len(verified)} different link hypotheses were "
+                           f"confirmed by neighbouring pairs")
+        if rival_sup >= need:
+            return False, (f"ambiguous: two inconsistent groups of matches "
+                           f"({sup} vs {rival_sup} independent) and none confirmed locally")
+        n_conf = max((sum(1 for c in all_tested if c.get("measured") and c["res"] <= tol)), 0)
+        return False, (f"only {sup} independent match(es) of {need} required "
+                       f"({len(cands)} candidate matches), and no anchor was confirmed "
+                       f"by {need_v} neighbouring pairs ({len(all_tested)} pairs tested, "
+                       f"{n_conf} consistent)")
+
+    # ------------------------------------------------------------------
+    def _gap_recovery(self, progress=None, cancel=None):
+        """Link temporally adjacent tracking segments using the stage motion
+        before the loss of tracking."""
+        st, reg = self.st, self.reg
+        segs: Dict[int, List[int]] = {}
+        for k in self.kf:
+            segs.setdefault(k.segment, []).append(k.id)
+        order = sorted(segs)
+        for sa, sb in zip(order, order[1:]):
+            A, B = segs[sa], segs[sb]
+            lab = components(self.n, self.edges)
+            if lab[A[-1]] == lab[B[0]]:
+                continue
+            if cancel and cancel():
+                raise InterruptedError
+            if progress:
+                progress(0.0, f"Gap recovery between tracking segments {sa} and {sb}")
+            P = self._component_poses()
+            L, F = A[-1], B[0]
+            tail = A[-4:]
+            v = np.zeros(2)
+            dt_tail = self.kf[tail[-1]].time - self.kf[tail[0]].time
+            if len(tail) >= 2 and dt_tail > 0:
+                v = (P[tail[-1], :2] - P[tail[0], :2]) / dt_tail
+            dt = max(0.0, self.kf[F].time - self.kf[L].time)
+            pF = P[L, :2] + v * dt               # predicted position of F (frame of A)
+            radius = st.link_gap_window * self.D + 0.5 * float(np.linalg.norm(v * dt))
+            gk = max(1, int(st.link_gap_keyframes))
+            jobs = []
+            for i in A[-gk:]:
+                for j in B[:gk]:
+                    pj = pF + (P[j, :2] - P[F, :2])
+                    d = _rot(P[i, 2]).T @ (pj - P[i, :2])
+                    if np.linalg.norm(d) - radius > self.D:
+                        continue                  # cannot overlap anywhere in the window
+                    jobs.append((i, j, RelPose(float(d[0]), float(d[1]), 0.0)))
+
+            def work(job):
+                i, j, pred = job
+                return reg.link_local(self.kf[i].prep, self.kf[j].prep, pred,
+                                      radius / self.D)
+
+            with ThreadPoolExecutor(self.threads) as ex:
+                results = list(ex.map(work, jobs))
+            cands = []
+            for (i, j, pred), (cm, rel) in zip(jobs, results):
+                if rel is not None:
+                    cands.append(self._candidate(i, j, rel, cm, P, "gap"))
+            ca = np.flatnonzero(lab == lab[A[-1]])
+            cb = np.flatnonzero(lab == lab[B[0]])
+            ok, reason = self._decide(cands, ca, cb, P, len(cb), cancel,
+                                      what=f"gap recovery: segment {sb}")
+            if ok:
+                self.log.append(reason)
+            else:
+                self.log.append(f"gap recovery between segments {sa} and {sb} failed "
+                                f"({len(jobs)} pairs tried): {reason}")
+
+    def _try_link(self, members: np.ndarray, main: np.ndarray, P: np.ndarray,
+                  cancel=None) -> Tuple[bool, str]:
+        st, reg = self.st, self.reg
+        if len(members) < 2:
+            return False, "single keyframe"
 
         # sampled keyframes of the segment (specimen data cached for them)
         seg = [int(i) for i in members
                if reg.link_data(self.kf[i].prep, cache=False).frac >= st.link_min_content]
-        if len(seg) < need:
+        if not seg:
             return False, "too little specimen (rest is background/edge) in the frames"
         samples = [seg[k] for k in np.unique(np.linspace(0, len(seg) - 1,
                                                           min(st.link_samples, len(seg))).astype(int))]
@@ -350,100 +622,16 @@ class PoseGraph:
 
         with ThreadPoolExecutor(self.threads) as ex:
             rels = list(ex.map(fine, coarse))
-        cands = []
-        for (peak, m, s, cm), rel in zip(coarse, rels):
-            if rel is None:
-                continue
-            # transform segment frame -> main frame implied by this match
-            th = P[m, 2] + rel.phi
-            t = P[m, :2] + _rot(P[m, 2]) @ np.array([rel.dx, rel.dy])
-            thT = th - P[s, 2]
-            tT = t - _rot(thT) @ P[s, :2]
-            cands.append(dict(m=m, s=s, rel=rel, cm=cm, th=thT, t=tT))
-
-        rec_base = dict(attempt=comp_no, segment_size=len(members))
-
-        def record(c, status, residual=float("nan")):
-            self.link_records.append(dict(
-                rec_base, main_kf=c["m"], seg_kf=c["s"],
-                main_frame=self.kf[c["m"]].frame_index, seg_frame=self.kf[c["s"]].frame_index,
-                ncc=c["cm"].peak, second_peak=c["cm"].second, quality=c["rel"].quality,
-                overlap=c["rel"].overlap, tx=c["t"][0], ty=c["t"][1],
-                rot_deg=math.degrees(c["th"]), residual_px=residual, status=status,
-                rel=c["rel"]))
-
+        cands = [self._candidate(m, s, rel, cm, P, "global")
+                 for (peak, m, s, cm), rel in zip(coarse, rels) if rel is not None]
         if not cands:
             return False, (f"no reliable specimen match found "
                            f"({len(coarse)} coarse candidates, none passed fine alignment)")
-
-        centre = np.nanmean(P[members, :2], axis=0)
-
-        def mapped(thT, tT):
-            return _rot(thT) @ centre + tT
-
-        def agree(a, b):
-            return (abs(a["th"] - b["th"]) < rot_tol and
-                    np.linalg.norm(mapped(a["th"], a["t"]) - mapped(b["th"], b["t"])) < tol)
-
-        def support(group):
-            """Number of independent matches: distinct, non-adjacent keyframes
-            on both sides."""
-            def count(ids):
-                n, last = 0, None
-                for i in sorted(set(ids)):
-                    if last is None or i - last >= 2:
-                        n += 1
-                        last = i
-                return n
-            return min(count(c["s"] for c in group), count(c["m"] for c in group))
-
-        def best_cluster(pool):
-            best, best_key = [], (0, 0.0)
-            for c in pool:
-                grp = [d for d in pool if agree(c, d)]
-                key = (support(grp), sum(d["rel"].quality for d in grp))
-                if key > best_key:
-                    best, best_key = grp, key
-            return best, best_key[0]
-
-        inl, sup = best_cluster(cands)
-        # unified transform from the consistent matches, then residuals
-        thT = float(np.mean([c["th"] for c in inl]))
-        cT = np.mean([mapped(c["th"], c["t"]) for c in inl], axis=0)
-        tT = cT - _rot(thT) @ centre
-        for c in cands:
-            c["res"] = float(np.linalg.norm(
-                _rot(thT) @ P[c["s"], :2] + tT - (_rot(c["th"]) @ P[c["s"], :2] + c["t"])))
-        inl = [c for c in inl if c["res"] <= tol]
-        sup = support(inl)
-        rest = [c for c in cands if not any(c is d for d in inl)]
-        rival, rival_sup = best_cluster(rest)
-
-        status_ok = sup >= need and rival_sup < need
-        if not status_ok:
-            for c in cands:
-                record(c, "rejected", c["res"])
-            if sup < need:
-                return False, (f"only {sup} consistent independent match(es) out of {need} "
-                               f"required ({len(cands)} candidate matches)")
-            return False, (f"ambiguous: two inconsistent groups of matches "
-                           f"({sup} vs {rival_sup} independent matches)")
-        for c in cands:
-            if any(c is d for d in inl):
-                record(c, "accepted", c["res"])
-                self.edges.append(Edge(c["m"], c["s"], c["rel"], "link"))
-                self.tested.add((min(c["m"], c["s"]), max(c["m"], c["s"])))
-            else:
-                record(c, "outlier", c["res"])
-        resid = max(c["res"] for c in inl)
-        return True, (f"segment of {len(members)} keyframes linked by {len(inl)} matches "
-                      f"({sup} independent, max residual {resid:.1f} px): "
-                      + ", ".join(f"{c['m']}-{c['s']}" for c in inl[:8])
-                      + (" ..." if len(inl) > 8 else ""))
+        return self._decide(cands, main, members, P, len(members), cancel)
 
     def loop_closure(self, radius_frac: float, progress=None, cancel=None) -> int:
         st = self.st
-        idx = np.flatnonzero(self.active)
+        idx = np.flatnonzero(self.kept)
         if len(idx) < 3:
             return 0
         pos = self.poses[idx, :2]
@@ -457,8 +645,8 @@ class PoseGraph:
             i, j = int(idx[a]), int(idx[b])
             if i > j:
                 i, j = j, i
-            if (i, j) in self.tested:
-                continue
+            if (i, j) in self.tested or self.comp[i] != self.comp[j]:
+                continue          # poses of different components are unrelated
             dist = float(np.linalg.norm(pos[a] - pos[b]))
             cand.append((abs(i - j) <= 3, dist, i, j))
         cand.sort(key=lambda c: c[1])
@@ -497,42 +685,67 @@ class PoseGraph:
         return added
 
     def optimise(self):
-        """Solve, remove outlier edges, re-solve; keep main component."""
+        """Solve every connected component (each in its own frame), remove
+        outlier edges, re-solve.  The largest component is the main mosaic;
+        other components with at least `min_component_keyframes` keyframes
+        are kept as separate (unlinked) mosaics, smaller ones are dropped."""
         thr = self.st.outlier_threshold * self.D
         removed = 0
         for _ in range(30):
-            main = self._main_component()
-            known = main[~np.isnan(self.poses[main]).any(axis=1)]
-            # start from a node whose pose is already known, so that existing
-            # poses and newly integrated ones share the same gauge
-            root = int(known[0]) if len(known) else int(main[0])
-            init = integrate(self.n, self.edges, root,
-                             self.poses if len(known) else None)
-            # nodes of main component that still have NaN get chain values
-            fresh = integrate(self.n, self.edges, root)
-            bad = np.isnan(init).any(axis=1)
-            init[bad] = fresh[bad]
-            # gauge: keep root where it was
-            self.poses = solve(init, self.edges, main, self.use_rot, self.D)
-            in_main = np.zeros(self.n, bool)
-            in_main[main] = True
-            res = np.array([edge_residual(self.poses, e) if in_main[e.i] and in_main[e.j] else 0.0
-                            for e in self.edges])
+            lab = components(self.n, self.edges)
+            newp = np.full((self.n, 3), np.nan)
+            for c in np.unique(lab):
+                nodes = np.flatnonzero(lab == c)
+                P0 = self.poses.copy()
+                known = nodes[~np.isnan(P0[nodes]).any(axis=1)]
+                if len(known) and self._prev_lab is not None:
+                    # nodes solved earlier in different components have
+                    # different gauges: keep only the largest group
+                    groups = self._prev_lab[known]
+                    vals, cnt = np.unique(groups, return_counts=True)
+                    keep_g = vals[int(np.argmax(cnt))]
+                    P0[known[groups != keep_g]] = np.nan
+                    known = known[groups == keep_g]
+                root = int(known[0]) if len(known) else int(nodes[0])
+                init = integrate(self.n, self.edges, root, P0 if len(known) else None)
+                fresh = integrate(self.n, self.edges, root)
+                bad = np.isnan(init).any(axis=1)
+                init[bad] = fresh[bad]
+                if len(nodes) >= 2:
+                    sol = solve(init, self.edges, nodes, self.use_rot, self.D)
+                    newp[nodes] = sol[nodes]
+                else:
+                    newp[nodes] = 0.0
+            self.poses = newp
+            self._prev_lab = lab
+            res = np.array([edge_residual(self.poses, e) for e in self.edges])
             if len(res) == 0 or res.max() <= thr:
                 break
             cut = max(thr, 0.5 * res.max())
             keep = res <= cut
             removed += int((~keep).sum())
             self.edges = [e for e, k in zip(self.edges, keep) if k]
-        main = self._main_component()
-        self.active = np.zeros(self.n, bool)
-        self.active[main] = True
-        if self.n == 1:
-            self.active[:] = True
-            self.poses[:] = 0
-        self.poses[~self.active] = np.nan
+        lab = components(self.n, self.edges)
+        self._prev_lab = lab
+        vals, cnt = np.unique(lab, return_counts=True)
+        order = vals[np.argsort(-cnt, kind="stable")]
+        self.comp = np.full(self.n, -1, int)
+        k = 0
+        for rank, c in enumerate(order):
+            nodes = lab == c
+            if rank == 0:
+                self.comp[nodes] = 0
+            elif self.st.save_unlinked and nodes.sum() >= self.st.min_component_keyframes:
+                k += 1
+                self.comp[nodes] = k
+        self.active = self.comp == 0
+        self.kept = self.comp >= 0
+        self.poses[~self.kept] = np.nan
+        extra = int((self.comp > 0).sum())
         self.log.append(f"optimisation: removed {removed} inconsistent edges, "
-                        f"{self.active.sum()}/{self.n} keyframes kept")
+                        f"{int(self.active.sum())}/{self.n} keyframes in the main mosaic"
+                        + (f", {extra} in {k} unlinked component(s)" if k else "")
+                        + (f", {int((~self.kept).sum())} dropped" if (~self.kept).any() else ""))
         return removed
 
     def run(self, progress: Optional[Callable[[float, str], None]] = None,

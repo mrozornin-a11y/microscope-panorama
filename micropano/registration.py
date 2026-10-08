@@ -407,6 +407,23 @@ class Registrar:
                                              st.min_overlap_area * self.ncc.area)
         return self._peak(ncc, valid, ov, self.ncc.area, None, None, strict=True)
 
+    def link_local(self, a: Prepared, b: Prepared, pred: RelPose,
+                   radius_frac: float) -> Tuple[Optional[CoarseMatch], Optional[RelPose]]:
+        """Specimen-only registration of b relative to a, searching only
+        within `radius_frac` x diameter around the predicted pose (used to
+        verify a link hypothesis and for local gap recovery)."""
+        st = self.settings
+        la, lb = self.link_data(a, cache=False), self.link_data(b, cache=False)
+        if min(la.frac, lb.frac) < st.link_min_content:
+            return None, None
+        ncc, valid, ov = _masked_ncc_general(self.ncc, la.spectra, lb.spectra,
+                                             st.min_overlap_area * self.ncc.area)
+        cm = self._peak(ncc, valid, ov, self.ncc.area, self.pose_to_coarse_shift(pred),
+                        max(2.0, radius_frac * self.Dc), strict=False)
+        if cm is None:
+            return None, None
+        return cm, self.refine(a, b, cm, la.work_hp, lb.work_hp, la.core_w, lb.core_w)
+
     def link_refine(self, a: Prepared, b: Prepared, cm: CoarseMatch) -> Optional[RelPose]:
         la, lb = self.link_data(a, cache=False), self.link_data(b, cache=False)
         return self.refine(a, b, cm, la.work_hp, lb.work_hp, la.core_w, lb.core_w)

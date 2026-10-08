@@ -13,7 +13,7 @@ import numpy as np
 from .keyframes import KeyFrame
 from .registration import Registrar, RelPose
 
-_COLS = ["attempt", "segment_size", "status", "main_kf", "seg_kf", "main_frame",
+_COLS = ["attempt", "segment_size", "source", "status", "main_kf", "seg_kf", "main_frame",
          "seg_frame", "ncc", "second_peak", "quality", "overlap", "tx", "ty",
          "rot_deg", "residual_px"]
 
@@ -63,7 +63,7 @@ def link_preview(reg: Registrar, a: KeyFrame, b: KeyFrame, rel: RelPose,
 
 
 def write_link_diagnostics(out_dir: str, records: List[dict], kfs: List[KeyFrame],
-                           reg: Registrar, max_images: int = 60) -> str:
+                           reg: Registrar, max_images: int = 120) -> str:
     """segment_links.csv + one overlap preview per cross-segment match."""
     d = os.path.join(out_dir, "diagnostics")
     os.makedirs(d, exist_ok=True)
@@ -72,25 +72,29 @@ def write_link_diagnostics(out_dir: str, records: List[dict], kfs: List[KeyFrame
         wr = csv.writer(fh)
         wr.writerow(_COLS + ["preview"])
         # accepted first, then rejected, then outliers; best scores first
-        order = {"accepted": 0, "rejected": 1, "outlier": 2}
+        order = {"accepted": 0, "rejected": 1, "outlier": 2, "verify-failed": 3}
         recs = sorted(records, key=lambda r: (r["attempt"], order.get(r["status"], 3),
                                               -r["quality"]))
         for k, r in enumerate(recs):
             name = ""
             if k < max_images:
-                name = (f"link_a{r['attempt']:02d}_{r['status']}_kf{r['main_kf']}"
-                        f"-kf{r['seg_kf']}.jpg")
-                title = (f"attempt {r['attempt']}  {r['status'].upper()}  main kf {r['main_kf']} "
-                         f"(frame {r['main_frame']})  <-  segment kf {r['seg_kf']} "
-                         f"(frame {r['seg_frame']})\n"
-                         f"ncc {r['ncc']:.3f} (2nd {r['second_peak']:.3f})  "
-                         f"ECC {r['quality']:.3f}  overlap {r['overlap']:.2f}  "
-                         f"residual {r['residual_px']:.1f} px")
+                name = (f"link_a{r['attempt']:02d}_{r['source']}_{r['status']}"
+                        f"_kf{r['main_kf']}-kf{r['seg_kf']}.jpg")
+                if r.get("predicted"):
+                    l2 = "no match at the PREDICTED position (overlay shows the prediction)"
+                else:
+                    l2 = (f"ncc {r['ncc']:.3f} (2nd {r['second_peak']:.3f})  "
+                          f"ECC {r['quality']:.3f}  overlap {r['overlap']:.2f}  "
+                          f"residual {r['residual_px']:.1f} px")
+                title = (f"attempt {r['attempt']} {r['source']}  {r['status'].upper()}  "
+                         f"kf {r['main_kf']} (frame {r['main_frame']})  <-  kf {r['seg_kf']} "
+                         f"(frame {r['seg_frame']})\n" + l2)
                 img = link_preview(reg, kfs[r["main_kf"]], kfs[r["seg_kf"]], r["rel"], title)
                 cv2.imwrite(os.path.join(d, name), img, [cv2.IMWRITE_JPEG_QUALITY, 90])
             row = []
             for c in _COLS:
                 v = r[c]
-                row.append(f"{v:.4f}" if isinstance(v, float) else v)
+                row.append("" if isinstance(v, float) and v != v else
+                           f"{v:.4f}" if isinstance(v, float) else v)
             wr.writerow(row + [name])
     return path

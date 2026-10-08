@@ -80,9 +80,11 @@ def snake_path(x0, x1, y0, n_pass, pass_step, speed, pause_every=0):
 def make_video(path: str, width=1280, height=720, radius=380, seed=0,
                n_pass=4, speed=14.0, rot_deg=0.0, fps=30.0,
                blur_prob=0.08, gt_path=None, specimen_size=(3600, 2400), jump=0,
-               jumps=(), border=0.0, contrast=1.0, pass_step=0.62):
+               jumps=(), border=0.0, contrast=1.0, pass_step=0.62, noise_bursts=()):
     """jump: drop that many frames at 3/8 of the path (tracking loss);
     jumps: list of (fraction of path, frames to drop);
+    noise_bursts: list of (fraction of path, frames, sigma) - stretches of
+    very noisy frames that break sequential tracking without a large jump;
     border: black margin around the specimen (fraction of the FOV diameter),
     so that the frames of the outer passes see the specimen edge."""
     rng = np.random.default_rng(seed + 1)
@@ -149,7 +151,12 @@ def make_video(path: str, width=1280, height=720, radius=380, seed=0,
             ker /= ker.sum()
             fr = cv2.filter2D(fr, -1, ker)
         fr *= vign * (1.0 + rng.normal(0, 0.02))
-        fr += rng.normal(0, 3.0, fr.shape).astype(np.float32)
+        sigma = 3.0
+        for frac, nb, sb in noise_bursts:
+            k0 = int(len(path_xy) * frac)
+            if k0 <= k < k0 + nb:
+                sigma = sb
+        fr += rng.normal(0, sigma, fr.shape).astype(np.float32)
         wr.write(np.clip(fr, 0, 255).astype(np.uint8))
         gt.append((k, sx, sy, math.degrees(th)))
     wr.release()
@@ -173,12 +180,16 @@ if __name__ == "__main__":
     ap.add_argument("--jumps", type=str, default="",
                     help="comma-separated frac:frames, e.g. 0.35:80,0.85:80")
     ap.add_argument("--border", type=float, default=0.0)
+    ap.add_argument("--noise-bursts", type=str, default="",
+                    help="comma-separated frac:frames:sigma, e.g. 0.3:12:80")
     ap.add_argument("--contrast", type=float, default=1.0)
     ap.add_argument("--pass-step", type=float, default=0.62,
                     help="distance between passes, fraction of the diameter")
     a = ap.parse_args()
     gt, circ, _ = make_video(a.out, gt_path=a.gt, rot_deg=a.rot, n_pass=a.passes, seed=a.seed,
                             jump=a.jump, border=a.border, contrast=a.contrast, pass_step=a.pass_step,
+                            noise_bursts=[tuple(float(v) for v in j.split(":"))
+                                          for j in a.noise_bursts.split(",") if j],
                             specimen_size=tuple(int(v) for v in a.size.split("x")),
                             jumps=[tuple(float(v) for v in j.split(":"))
                                    for j in a.jumps.split(",") if j])
