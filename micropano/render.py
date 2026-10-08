@@ -7,6 +7,7 @@ The mosaic is rendered in square tiles and streamed directly into a tiled
 from __future__ import annotations
 
 import math
+import warnings
 import threading
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -60,7 +61,8 @@ def estimate_flat_field(thumbs: Sequence[np.ndarray], fov: FieldOfView,
     bg = gray < np.maximum(dark_level, 0.3 * p95)[:, None, None]
     stack[bg] = np.nan
     n_valid = (~bg).sum(axis=0)
-    with np.errstate(all="ignore"):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)   # all-background pixels
         med = np.nanmedian(stack, axis=0)
     mask &= n_valid >= max(5, 0.3 * len(thumbs))
     if mask.sum() < 0.5 * (fov.mask(thumb_scale, shrink_px=1)[:h, :w] > 0).sum():
