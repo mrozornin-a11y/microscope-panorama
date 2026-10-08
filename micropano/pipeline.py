@@ -148,7 +148,8 @@ class Pipeline:
             if st.flat_field:
                 kept = np.flatnonzero(graph.kept)
                 gain = estimate_flat_field([kfs[i].thumb for i in kept], fov,
-                                           sel.thumb_scale, fov.crop_size)
+                                           sel.thumb_scale, fov.crop_size,
+                                           st.link_dark_level)
                 self._say("flat-field correction: " + ("applied" if gain is not None
                                                         else "skipped (too few keyframes)"))
 

@@ -38,20 +38,33 @@ class RenderFrame:
 # flat field
 # --------------------------------------------------------------------------
 def estimate_flat_field(thumbs: Sequence[np.ndarray], fov: FieldOfView,
-                        thumb_scale: float, out_size) -> Optional[np.ndarray]:
+                        thumb_scale: float, out_size,
+                        dark_level: float = 25.0) -> Optional[np.ndarray]:
     """Estimate the illumination profile (vignetting) of the microscope.
 
     The per-pixel median over many keyframes taken at different stage
     positions averages out the specimen; a smooth 2-D polynomial fitted to it
-    is the illumination.  Returns a gain image (full crop size, float32,
-    3 channels) to multiply frames with, or None.
+    is the illumination.  Dark background around the specimen is excluded
+    from the median (otherwise frames along the specimen edge would make the
+    illumination look dark on that side and over-brighten it).  Returns a
+    gain image (full crop size, float32, 3 channels) to multiply frames
+    with, or None.
     """
     if len(thumbs) < 8:
         return None
     stack = np.stack([t.astype(np.float32) for t in thumbs])
-    med = np.median(stack, axis=0)
-    h, w = med.shape[:2]
+    gray = stack.mean(axis=3)
+    h, w = stack.shape[1:3]
     mask = fov.mask(thumb_scale, shrink_px=1)[:h, :w] > 0
+    p95 = np.percentile(gray[:, mask], 95, axis=1)
+    bg = gray < np.maximum(dark_level, 0.3 * p95)[:, None, None]
+    stack[bg] = np.nan
+    n_valid = (~bg).sum(axis=0)
+    with np.errstate(all="ignore"):
+        med = np.nanmedian(stack, axis=0)
+    mask &= n_valid >= max(5, 0.3 * len(thumbs))
+    if mask.sum() < 0.5 * (fov.mask(thumb_scale, shrink_px=1)[:h, :w] > 0).sum():
+        return None     # too few specimen samples to estimate the profile
     cx, cy = fov.center_in_crop(thumb_scale)
     r = fov.r_eff * thumb_scale
     yy, xx = np.mgrid[0:h, 0:w].astype(np.float64)
